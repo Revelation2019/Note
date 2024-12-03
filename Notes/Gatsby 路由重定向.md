@@ -9,6 +9,7 @@
 在 Gatsby 中，src/pages 目录下的文件会自动转换成静态 HTML 页面，这样的架构可确保初次加载时的快速响应。而使用 @reach/router 提供的客户端路由机制——通过 history 模式，URL 的变化不会导致页面重载。相反，Router 组件会捕获这些变化，动态地重新计算并渲染匹配的路由组件，从而实现平滑的导航体验。
 
 ```tsx
+// src/pages/index.tsx
 import { Router, Redirect, Location, RouteComponentProps } from '@reach/router';
 import { FC, Fragment } from 'react';
 
@@ -192,17 +193,20 @@ navigate(to, { state, replace = false } = {}) {
 
 从上述路由监听逻辑来看，与结果一致，路由重定向确实已经成功执行。
 
-从断点调试来看，之所以页面最终跳转到 404 错误页面，是因为 Gatsby 在构建过程中会为 src/pages 目录中的每个文件生成对应的 HTML 文件和一个相应的页面数据文件 page-data.json。然而，/home 路由并没有实际的 HTML 文件。当 Gatsby 监听到路由变化后，会尝试请求该路由对应的页面数据，即 http://localhost:8888/page-data/home/page-data.json。由于这个请求返回了 404 响应，Gatsby 随即渲染开发环境下的默认 404 页面（这不是用户自定义 404 页面）。
+通过断点调试可以发现，页面最终跳转至 404 错误页面的原因在于 Gatsby 的构建过程。Gatsby 在构建过程中，会为 `src/pages` 目录中的每个文件生成相应的 HTML、componentChunk 文件以及页面数据文件 `page-data.json`。然而，由于 `src/pages` 目录下并不存在 `home.tsx` 文件，所以在构建过程中不会生成与之对应的页面资源。当 Gatsby 监听到路由变化时，它会尝试请求该路由对应的页面数据，即 `http://localhost:8888/page-data/home/page-data.json`。由于该请求返回了 404 响应，Gatsby 在开发环境下渲染了默认的 404 页面（不是用户自定义的 404 页面）。
+
+详细过程如下：
+
+（1）首先，在 Gatsby 提供的浏览器 API 钩子函数 onClientEntry 中，该钩子允许在客户端 JavaScript 入口文件执行之前运行指定代码。在这一阶段，Gatsby 会加载与当前路由页面相对应的资源（包括 chunk 文件和 page-data.json）。一旦这些资源成功加载，Root 组件便会被挂载。
 
 ```js
-// 1、onClientEntry：Gatsby 提供的钩子，用于在客户端 JavaScript 入口文件执行之前运行代码
 apiRunnerAsync(`onClientEntry`).then(() => {
   Promise.all([
     loader.loadPage(`/dev-404-page/`),
     loader.loadPage(`/404.html`),
     loader.loadPage(window.location.pathname + window.location.search),
   ]).then(() => {
-    // 加载成功挂载组件
+    // 加载成功挂载 Root
     function App() { return <Root /> }
     function runRender() { renderer(<App />, rootElement) }
 
@@ -227,9 +231,11 @@ apiRunnerAsync(`onClientEntry`).then(() => {
     }
   })
 })
+```
 
+（2）在渲染 Root 组件时，该组件会根据 location 确认当前路由所对应的页面资源是否存在。如果页面资源存在，组件将渲染与该路由匹配的组件；如果页面资源不存在，则渲染开发环境下的默认 404 组件。
 
-// 2、Root
+```js
 class LocationHandler extends React.Component {
   render() {
     const { location } = this.props;
@@ -298,287 +304,241 @@ export default function AppRoot() {
     </FastRefreshOverlay>
   );
 }
-
-
-// 2、loadPage: 加载页面数据
-class BaseLoader {
-  loadPage(rawPath) {
-    const pagePath = findPath(rawPath)
-    if (this.pageDb.has(pagePath)) {
-      const page = this.pageDb.get(pagePath)
-      if (process.env.BUILD_STAGE !== `develop` || !page.payload.stale) {
-        if (page.error) {
-          return Promise.resolve({
-            error: page.error,
-            status: page.status,
-          })
-        }
-
-        return Promise.resolve(page.payload)
-      }
-    }
-
-    if (this.inFlightDb.has(pagePath)) {
-      return this.inFlightDb.get(pagePath)
-    }
-
-    const loadDataPromises = [
-      this.loadAppData(),
-      this.loadPageDataJson(pagePath),
-    ]
-
-    if (global.hasPartialHydration) {
-      loadDataPromises.push(this.loadPartialHydrationJson(pagePath))
-    }
-
-    const inFlightPromise = Promise.all(loadDataPromises).then(allData => {
-      const [appDataResponse, pageDataResponse, rscDataResponse] = allData
-
-      if (
-        pageDataResponse.status === PageResourceStatus.Error ||
-        rscDataResponse?.status === PageResourceStatus.Error
-      ) {
-        return {
-          status: PageResourceStatus.Error,
-        }
-      }
-
-      let pageData = pageDataResponse.payload
-
-      const {
-        componentChunkName,
-        staticQueryHashes: pageStaticQueryHashes = [],
-        slicesMap = {},
-      } = pageData
-
-      const finalResult = {}
-
-      const dedupedSliceNames = Array.from(new Set(Object.values(slicesMap)))
-
-      const loadSlice = slice => {
-        if (this.slicesDb.has(slice.name)) {
-          return this.slicesDb.get(slice.name)
-        } else if (this.sliceInflightDb.has(slice.name)) {
-          return this.sliceInflightDb.get(slice.name)
-        }
-
-        const inFlight = this.loadComponent(slice.componentChunkName).then(
-          component => {
-            return {
-              component: preferDefault(component),
-              sliceContext: slice.result.sliceContext,
-              data: slice.result.data,
-            }
-          }
-        )
-
-        this.sliceInflightDb.set(slice.name, inFlight)
-        inFlight.then(results => {
-          this.slicesDb.set(slice.name, results)
-          this.sliceInflightDb.delete(slice.name)
-        })
-
-        return inFlight
-      }
-
-      return Promise.all(
-        dedupedSliceNames.map(sliceName => this.loadSliceDataJson(sliceName))
-      ).then(slicesData => {
-        const slices = []
-        const dedupedStaticQueryHashes = [...pageStaticQueryHashes]
-
-        for (const { jsonPayload, sliceName } of Object.values(slicesData)) {
-          slices.push({ name: sliceName, ...jsonPayload })
-          for (const staticQueryHash of jsonPayload.staticQueryHashes) {
-            if (!dedupedStaticQueryHashes.includes(staticQueryHash)) {
-              dedupedStaticQueryHashes.push(staticQueryHash)
-            }
-          }
-        }
-
-        const loadChunkPromises = [
-          Promise.all(slices.map(loadSlice)),
-          this.loadComponent(componentChunkName, `head`),
-        ]
-
-        if (!global.hasPartialHydration) {
-          loadChunkPromises.push(this.loadComponent(componentChunkName))
-        }
-
-        // In develop we have separate chunks for template and Head components
-        // to enable HMR (fast refresh requires single exports).
-        // In production we have shared chunk with both exports. Double loadComponent here
-        // will be deduped by webpack runtime resulting in single request and single module
-        // being loaded for both `component` and `head`.
-        // get list of components to get
-        const componentChunkPromises = Promise.all(loadChunkPromises).then(
-          components => {
-            const [sliceComponents, headComponent, pageComponent] = components
-
-            finalResult.createdAt = new Date()
-
-            for (const sliceComponent of sliceComponents) {
-              if (!sliceComponent || sliceComponent instanceof Error) {
-                finalResult.status = PageResourceStatus.Error
-                finalResult.error = sliceComponent
-              }
-            }
-
-            if (
-              !global.hasPartialHydration &&
-              (!pageComponent || pageComponent instanceof Error)
-            ) {
-              finalResult.status = PageResourceStatus.Error
-              finalResult.error = pageComponent
-            }
-
-            let pageResources
-
-            if (finalResult.status !== PageResourceStatus.Error) {
-              finalResult.status = PageResourceStatus.Success
-              if (
-                pageDataResponse.notFound === true ||
-                rscDataResponse?.notFound === true
-              ) {
-                finalResult.notFound = true
-              }
-              pageData = Object.assign(pageData, {
-                webpackCompilationHash: appDataResponse
-                  ? appDataResponse.webpackCompilationHash
-                  : ``,
-              })
-
-              if (typeof rscDataResponse?.payload === `string`) {
-                pageResources = toPageResources(pageData, null, headComponent)
-
-                pageResources.partialHydration = rscDataResponse.payload
-
-                const readableStream = new ReadableStream({
-                  start(controller) {
-                    const te = new TextEncoder()
-                    controller.enqueue(te.encode(rscDataResponse.payload))
-                  },
-                  pull(controller) {
-                    // close on next read when queue is empty
-                    controller.close()
-                  },
-                  cancel() {},
-                })
-
-                return waitForResponse(
-                  createFromReadableStream(readableStream)
-                ).then(result => {
-                  pageResources.partialHydration = result
-
-                  return pageResources
-                })
-              } else {
-                pageResources = toPageResources(
-                  pageData,
-                  pageComponent,
-                  headComponent
-                )
-              }
-            }
-
-            // undefined if final result is an error
-            return pageResources
-          }
-        )
-
-        // get list of static queries to get
-        const staticQueryBatchPromise = Promise.all(
-          dedupedStaticQueryHashes.map(staticQueryHash => {
-            // Check for cache in case this static query result has already been loaded
-            if (this.staticQueryDb[staticQueryHash]) {
-              const jsonPayload = this.staticQueryDb[staticQueryHash]
-              return { staticQueryHash, jsonPayload }
-            }
-
-            return this.memoizedGet(
-              `${__PATH_PREFIX__}/page-data/sq/d/${staticQueryHash}.json`
-            )
-              .then(req => {
-                const jsonPayload = JSON.parse(req.responseText)
-                return { staticQueryHash, jsonPayload }
-              })
-              .catch(() => {
-                throw new Error(
-                  `We couldn't load "${__PATH_PREFIX__}/page-data/sq/d/${staticQueryHash}.json"`
-                )
-              })
-          })
-        ).then(staticQueryResults => {
-          const staticQueryResultsMap = {}
-
-          staticQueryResults.forEach(({ staticQueryHash, jsonPayload }) => {
-            staticQueryResultsMap[staticQueryHash] = jsonPayload
-            this.staticQueryDb[staticQueryHash] = jsonPayload
-          })
-
-          return staticQueryResultsMap
-        })
-
-        return (
-          Promise.all([componentChunkPromises, staticQueryBatchPromise])
-            .then(([pageResources, staticQueryResults]) => {
-              let payload
-              if (pageResources) {
-                payload = { ...pageResources, staticQueryResults }
-                finalResult.payload = payload
-                emitter.emit(`onPostLoadPageResources`, {
-                  page: payload,
-                  pageResources: payload,
-                })
-              }
-
-              this.pageDb.set(pagePath, finalResult)
-
-              if (finalResult.error) {
-                return {
-                  error: finalResult.error,
-                  status: finalResult.status,
-                }
-              }
-
-              return payload
-            })
-            // when static-query fail to load we throw a better error
-            .catch(err => {
-              return {
-                error: err,
-                status: PageResourceStatus.Error,
-              }
-            })
-        )
-      })
-    })
-
-    inFlightPromise
-      .then(() => {
-        this.inFlightDb.delete(pagePath)
-      })
-      .catch(error => {
-        this.inFlightDb.delete(pagePath)
-        throw error
-      })
-
-    this.inFlightDb.set(pagePath, inFlightPromise)
-
-    return inFlightPromise
-  }
-}
 ```
 
+有些同学可能会疑惑，为什么在 `Promise.all` 中，即便 `loader.loadPage("/home")` 加载页面资源失败，`then` 函数仍然会被执行。这是因为内部机制已对 `/page-data/home/page-data.json` 返回 `404` 的情况进行了处理。会将 `/home` 的页面资源映射到 `/404` 的页面资源，并将其记录在 `this.pageDataDb` 的 `Map` 结构中。接下来，在渲染 `Root` 组件时，通过判断 `loader.isPageNotFound("/home")` 返回 `true`，从而决定渲染 `404` 页面。
+
+![Img](./FILES/Gatsby%20路由重定向.md/img-20241203162335.png)
+
+![Img](./FILES/Gatsby%20路由重定向.md/img-20241203163753.png)
+
+![Img](./FILES/Gatsby%20路由重定向.md/img-20241203165541.png)
 
 ## createRedirect
 
-onClientEntry --> loader.loadPage(window.location.pathname + window.location.search) --> this.loadPageDataJson(pagePath) --> this.fetchPageDataJson({ pagePath })
+在断点调试过程中发现，如果项目中配置了重定向（例如 `{fromPath: '/', toPath: '/home'}`），那么 `loader.isPageNotFound(fromPath)` 将转化为 `loader.isPageNotFound(toPath)` 的判断。这意味着系统会依据重定向的目标路径来判定页面的存在性。
 
+```js
+import redirects from "./redirects.json"
+
+// Convert to a map for faster lookup in maybeRedirect()
+
+const redirectMap = new Map()
+const redirectIgnoreCaseMap = new Map()
+
+redirects.forEach(redirect => {
+  if (redirect.ignoreCase) {
+    redirectIgnoreCaseMap.set(redirect.fromPath, redirect)
+  } else {
+    redirectMap.set(redirect.fromPath, redirect)
+  }
+})
+
+export function maybeGetBrowserRedirect(pathname) {
+  let redirect = redirectMap.get(pathname)
+  if (!redirect) {
+    redirect = redirectIgnoreCaseMap.get(pathname.toLowerCase())
+  }
+  return redirect
+}
+
+export const findPath = rawPathname => {
+  const trimmedPathname = trimPathname(absolutify(rawPathname))
+  if (pathCache.has(trimmedPathname)) {
+    return pathCache.get(trimmedPathname)
+  }
+
+  // 存在重定向配置
+  const redirect = maybeGetBrowserRedirect(rawPathname)
+  if (redirect) {
+    return findPath(redirect.toPath)
+  }
+
+  // 路由匹配，比如 "/" 会匹配 "/[...]"
+  let foundPath = findMatchPath(trimmedPathname)
+
+  if (!foundPath) {
+    // 没有匹配上，就返回本身，比如 /home 并没有对应 ./home.tsx，也没有匹配的动态路由
+    foundPath = cleanPath(rawPathname)
+  }
+
+  pathCache.set(trimmedPathname, foundPath)
+
+  return foundPath
+}
 ```
-src/
-└── pages/
-    ├── home/
-    │   └── index.tsx
-    └── index.tsx
+
+以下是重定向配置的过程：如果在 `gatsby-node.js` 中定义了 `createPages`，可以在创建页面的同时创建重定向。通过调用 `actions.createRedirect`，将生成一个类型为 `CREATE_REDIRECT` 的 Action。派发该 Action 后，会通过 `redirectsReducer` 将重定向配置存入内置的 Redux 状态对象中。最终，在 `CREATE_REDIRECT` 事件触发时，这些配置会被写入到 `.cache-dir/redirects.json` 文件中。
+
+```js
+/**
+ * // Generally you create redirects while creating pages.
+ * exports.createPages = ({ graphql, actions }) => {
+ *   const { createRedirect } = actions
+ *
+ *   createRedirect({ fromPath: '/old-url/', toPath: '/new-url/', isPermanent: true })
+ *   createRedirect({ fromPath: '/url/', toPath: '/zn-CH/url/', conditions: { language: 'zn' }})
+ *   createRedirect({ fromPath: '/url/', toPath: '/en/url/', conditions: { language: ['ca', 'us'] }})
+ *   createRedirect({ fromPath: '/url/', toPath: '/ca/url/', conditions: { country: 'ca' }})
+ *   createRedirect({ fromPath: '/url/', toPath: '/en/url/', conditions: { country: ['ca', 'us'] }})
+ *   createRedirect({ fromPath: '/not_so-pretty_url/', toPath: '/pretty/url/', statusCode: 200 })
+ *
+ *   // Create pages here
+ * }
+ */
+actions.createRedirect = ({
+  fromPath,
+  isPermanent = false,
+  redirectInBrowser = false,
+  toPath,
+  ignoreCase = true,
+  ...rest
+}) => {
+  let pathPrefix = ``;
+  if (store.getState().program.prefixPaths) {
+    pathPrefix = store.getState().config.pathPrefix;
+  }
+  return {
+    type: `CREATE_REDIRECT`,
+    payload: {
+      fromPath: maybeAddPathPrefix(fromPath, pathPrefix),
+      isPermanent,
+      ignoreCase,
+      redirectInBrowser,
+      toPath: maybeAddPathPrefix(toPath, pathPrefix),
+      ...rest
+    }
+  };
+};
 ```
+
+以下是定义的 Reducer：
+
+```js
+const redirectsReducer = (state = [], action) => {
+  switch (action.type) {
+    case `CREATE_REDIRECT`:
+      {
+        const redirect = action.payload;
+
+        // Add redirect only if it wasn't yet added to prevent duplicates
+        if (!exists(redirect)) {
+          add(redirect);
+          state.push(redirect);
+        }
+        return state;
+      }
+    default:
+      return state;
+  }
+};
+```
+
+以下是将重定向配置写入 `.cache-dir/redirects.json` 的过程：
+
+![Img](./FILES/Gatsby%20路由重定向.md/img-20241203171957.png)
+
+因此，即使在动态创建页面时设置了重定向，也无法解决问题，因为 `/home` 页面资源依然会被判断为不存在，最终仍然会显示 404 页面。
+
+```js
+// gatsby-node.js
+export const createPages = async ({ graphql, actions }) => {
+  const { createRedirect } = actions;
+
+  redirects.forEach((redirect) => {
+    createRedirect({
+      fromPath: '/',
+      toPath: '/home',
+      isPermanent: true,
+      redirectInBrowser: true,
+      statusCode: 302,
+    });
+  });
+};
+```
+
+## Dynamic Routes
+
+在 Gatsby 中，内部制定了一套路由约定，允许通过文件名配置动态路由。例如，`/src/pages/[...].tsx` 会生成 `[...].html` 和 `/page-data/[...]/page-data.json`，以及相应的组件块（componentChunk）。当访问 `/` 时，如果 `src/pages` 中没有 `index.tsx`，就不会生成 `index.html`，因此会匹配到 `[...]` 路由，并加载其页面资源。类似地，当访问 `/home` 时，如果 `src/pages` 中没有 `home.tsx`，也不会生成 `home.html`，从而会匹配到 `[...]` 路由，并加载其页面资源。从 `/` 重定向到 `/home` 的逻辑也是遵循这一规则。
+
+![Img](./FILES/Gatsby%20路由重定向.md/img-20241203200441.png)
+
+![Img](./FILES/Gatsby%20路由重定向.md/img-20241203200530.png)
+
+因此，我们可以将 `[...].tsx` 视作一个路由分发层，负责处理路由的分发和重定向。
+
+```tsx
+// src/
+// └── pages/
+//     └── [...].tsx
+
+// src/pages/[...].tsx
+import { Router, Redirect, Location, RouteComponentProps } from '@reach/router';
+import { FC, Fragment } from 'react';
+
+const Home: FC<RouteComponentProps> = () => <div>Home Page</div>;
+const About: FC<RouteComponentProps> = () => <div>About Page</div>;
+const Blog: FC<RouteComponentProps> = () => <div>Blog Page</div>;
+
+const IndexPage = () => {
+  return (
+    <Location>
+      {
+        ({ location }) => (
+          <Router>
+            <Redirect from="/" to="/home" noThrow />
+            <Home path="/home"/>
+            <About path="/about"/>
+            <Blog path="/blog"/>
+          </Router>
+        )
+      }
+    </Location>
+  );
+}
+```
+
+为了避免将所有路由组件打包到一个单独的组件块（component chunk）中，可以使用 `React.Suspense` 和 `React.lazy` 来动态加载组件，实现代码拆分。
+
+```jsx
+const LazyComponent = React.lazy(() => import('./LazyComponent'));
+
+function App() {
+  return (
+    <div>
+      <React.Suspense fallback={<div>Loading...</div>}>
+        <LazyComponent />
+      </React.Suspense>
+    </div>
+  );
+}
+// src/pages/[...].tsx
+import { Router, Redirect, Location, RouteComponentProps } from '@reach/router';
+import { FC, Fragment } from 'react';
+
+const Home: FC<RouteComponentProps> = () => <div>Home Page</div>;
+const About: FC<RouteComponentProps> = () => <div>About Page</div>;
+const Blog: FC<RouteComponentProps> = () => <div>Blog Page</div>;
+
+const IndexPage = () => {
+  return (
+    <Location>
+      {
+        ({ location }) => (
+          <Router>
+            <Redirect from="/" to="/home" noThrow />
+            <Home path="/home"/>
+            <About path="/about"/>
+            <Blog path="/blog"/>
+          </Router>
+        )
+      }
+    </Location>
+  );
+}
+```
+
+通过这种方式，只有在实际需要某个组件时，才会加载其相应的代码，从而实现更高效的路由管理和资源利用。
+
+## gatsby-plugin-meta-redirect & gatsby-plugin-client-side-redirect
+
