@@ -616,7 +616,33 @@ export const createPages = async ({ graphql, actions }) => {
 
 `onPostBuild` 是 `Gatsby` 在构建过程中的一个生命周期钩子，它仅在构建过程结束后执行，也就是说，它只会在生产构建环境中运行。在开发环境下（即使用 `gatsby develop` 启动时），`onPostBuild` 并不会被调用。
 
+那么，可以在 `gatsby-config.js` 中可以使用 `developMiddleware` `API` 来实现开发环境中的代理重定向。
 
+```js
+// gatsby-config.js
+module.exports = {
+  developMiddleware: (app) => {
+    app.use((req, res, next) => {
+      if (req.url === '/') {
+        res.redirect(302, '/home');
+      } else {
+        next();
+      }
+    });
+  }
+}
+```
+
+在生产环境和开发环境中进行独立配置显得过于繁琐，一种理想的解决方案是统一配置以便在两者之间保持一致。可以利用 `onClientEntry` 钩子函数来监听路由变化。如果检测到当前路由需要重定向，可以执行 `window.location.href = "${toPath}"`。
+
+```js
+// gatsby-browser.js
+export const onClientEntry = () => {
+  if (location.pathname === "/") {
+    location.href = "/home";
+  }
+}
+```
 
 ### gatsby-plugin-client-side-redirect
 
